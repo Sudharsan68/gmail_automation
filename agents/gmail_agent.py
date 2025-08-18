@@ -1,41 +1,93 @@
-from browser_use.llm import ChatGroq
-from utils.env_loader import load_env
 import json
 import re
+from typing import Any, Dict, List, Optional
+from groq import Groq
+
+JSON_EXAMPLE = {
+    "to": ["recipient@example.com"],
+    "cc": [],
+    "bcc": [],
+    "subject": "Meeting Tomorrow at 2 PM",
+    "body": "Hi <name>,\n\nLet's meet tomorrow at 2 PM in the 3F conference room.\n\nBest,\nSudharsan",
+    "tone": "neutral",
+    "draft": False,
+}
+
+SYSTEM_RULES = (
+    "You are an expert email writing assistant.\n"
+    "- Always output STRICT JSON, no code block fences.\n"
+    "- Keys: to[list of strings], cc[list], bcc[list], subject[string], body[string], tone[string], draft[bool].\n"
+    "- Never include placeholders like 'TBD' if the user already gave details.\n"
+    "- If the user doesn't state recipients, infer from context if safe (e.g., 'my manager' -> manager@example.com) ONLY if the domain is provided; otherwise leave an EMPTY LIST for 'to'.\n"
+    "- Create a concise, informative SUBJECT from the request.\n"
+    "- Create a clear, well-structured BODY with salutation and sign-off when appropriate.\n"
+    "- Use the requested tone if specified (e.g., formal, friendly, assertive). Default tone is neutral.\n"
+    "- Keep line length readable; use newlines between paragraphs.\n"
+)
 
 class GmailAgent:
-    def __init__(self, groq_api_key, model="meta-llama/llama-4-maverick-17b-128e-instruct"):
-        self.llm = ChatGroq(model=model, api_key=groq_api_key)
-        self.env = load_env()
+    def __init__(self, groq_api_key: str, model: str = "llama-3.1-8b-instant"):
+        self.client = Groq(api_key=groq_api_key)
+        self.model = model
 
-    def login_instruction(self):
-        """Return a natural language instruction for logging in"""
-        return f"Log in to Gmail using {self.env['GMAIL_EMAIL']} and handle 2FA if prompted."
+    def _extract_json(self, text: str) -> str:
+        """Extract the first JSON object from arbitrary text.
+        Groq usually respects the instruction, but this is a safe-guard.
+        """
+        # If it is already pure JSON, just return
+        txt = text.strip()
+        if txt.startswith("{") and txt.endswith("}"):
+            return txt
+        # find the first {...} block
+        m = re.search(r"\{[\s\S]*\}", text)
+        if not m:
+            raise ValueError("Model did not return JSON.")
+        return m.group(0)
 
-    def parse_task(self, task: str) -> str:
-        """Parse task into JSON email data"""
-        task_lower = task.lower()
-        
-        if "send" in task_lower and "email" in task_lower:
-            # Extract email details using regex
-            email_match = re.search(r'[\w\.-]+@[\w\.-]+', task)
-            email = email_match.group(0) if email_match else "recipient@example.com"
-            
-            subject_match = re.search(r'subject ["\'](.*?)["\']', task)
-            subject = subject_match.group(1) if subject_match else "No Subject"
-            
-            body_match = re.search(r'body ["\'](.*?)["\']', task)
-            body = body_match.group(1) if body_match else "No Body"
-            
-            # Return JSON string
-            return json.dumps({
-                "to": email,
-                "subject": subject,
-                "body": body
-            })
-        
-        return json.dumps({
-            "to": "",
-            "subject": "",
-            "body": f"Manual steps needed for: {task}"
-        })
+    def parse_task(self, task: str, tone_hint: Optional[str] = None) -> Dict[str, Any]:
+        """Turn a natural language request into structured email instructions.
+        Returns a Python dict with keys: to, cc, bcc, subject, body, tone, draft
+        """
+        user_block = (
+            f"Task: {task}\n" + (f"Tone hint: {tone_hint}\n" if tone_hint else "") +
+            "Return ONLY a JSON object with the exact keys described."
+        )
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_RULES},
+                    {"role": "user", "content": user_block},
+                ],
+                temperature=0.2,
+                max_tokens=600,
+            )
+            raw = resp.choices[0].message.content
+            json_str = self._extract_json(raw)
+            data = json.loads(json_str)
+
+            # Post-validate and normalize
+            data.setdefault("to", [])
+            data.setdefault("cc", [])
+            data.setdefault("bcc", [])
+            data.setdefault("tone", "neutral")
+            data.setdefault("draft", False)
+
+            # Coerce scalar 'to' into list
+            if isinstance(data.get("to"), str):
+                data["to"] = [data["to"]]
+
+            # Basic checks
+            if not isinstance(data.get("subject", ""), str) or not data["subject"].strip():
+                raise ValueError("Missing subject from model output.")
+            if not isinstance(data.get("body", ""), str) or not data["body"].strip():
+                raise ValueError("Missing body from model output.")
+            for k in ("to", "cc", "bcc"):
+                if not isinstance(data[k], list):
+                    raise ValueError(f"'{k}' must be a list of strings")
+                # Make sure all are strings
+                data[k] = [str(v).strip() for v in data[k] if str(v).strip()]
+
+            return data
+        except Exception as e:
+            raise ValueError(f"Failed to parse task: {e}")
